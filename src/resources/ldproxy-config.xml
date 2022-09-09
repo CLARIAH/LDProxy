@@ -2,10 +2,4 @@
     <site match="http(s)?://purl.org/dc/terms/(?&lt;term&gt;.*)" recipe="nl.clariah.ldproxy.recipe.Cat">
         <file src="src/resources/dc.xml" mime="application/rdf+xml"/>
     </site>
-    <site match="http(s)?://www.wikidata.org/wiki/(?&lt;prop&gt;.*)" recipe="nl.clariah.ldproxy.recipe.Redirect">
-        <redir code="301 Moved Permanently" url="https://6mfxtrmiqk.execute-api.us-east-1.amazonaws.com/prod/wikidata/{$prop}/"/>
-    </site>
-    <site match="http(s)?://id.nlm.nih.gov/mesh/(?&lt;ident&gt;[^.]*).html" recipe="nl.clariah.ldproxy.recipe.Redirect">
-        <redir code="301 Moved Permanently" url="https://6mfxtrmiqk.execute-api.us-east-1.amazonaws.com/prod/mesh/{$ident}/"/>
-    </site>
 </LDProxy>

@@ -15,17 +15,26 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.math.BigInteger;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.security.KeyStore;
+import java.security.Principal;
+import java.security.cert.X509Certificate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 
 import javax.imageio.ImageIO;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
 
 import nl.clariah.ldproxy.recipe.Recipe;
 
@@ -115,7 +124,8 @@ public class RequestHandler implements Runnable {
             // Check request type
             if(request.equals("CONNECT")){
                     System.err.println("?DBG: HTTPS Request for : " + urlString + "\n");
-                    handleHTTPSRequest(urlString);
+                    // handleHTTPSRequest(urlString);
+                    handleHTTPSRequest2(urlString);
             } else {
                 Matcher m = null;
                 for (Pattern p:Proxy.ldsites.keySet()) {
@@ -302,68 +312,9 @@ public class RequestHandler implements Runnable {
 			proxyToClientBw.write(line);
 			proxyToClientBw.flush();
 			
-			
-			
 			// Client and Remote will both start sending data to proxy at this point
 			// Proxy needs to asynchronously read data from each party and send it to the other party
-
-
-			//Create a Buffered Writer betwen proxy and remote
-			BufferedWriter proxyToServerBW = new BufferedWriter(new OutputStreamWriter(proxyToServerSocket.getOutputStream()));
-
-			// Create Buffered Reader from proxy and remote
-			BufferedReader proxyToServerBR = new BufferedReader(new InputStreamReader(proxyToServerSocket.getInputStream()));
-
-
-
-			// Create a new thread to listen to client and transmit to server
-			ClientToServerHttpsTransmit clientToServerHttps = 
-					new ClientToServerHttpsTransmit(clientSocket.getInputStream(), proxyToServerSocket.getOutputStream());
-			
-			httpsClientToServer = new Thread(clientToServerHttps);
-			httpsClientToServer.start();
-			
-			
-			// Listen to remote server and relay to client
-			try {
-				byte[] buffer = new byte[4096];
-				int read;
-				do {
-					read = proxyToServerSocket.getInputStream().read(buffer);
-					if (read > 0) {
-						clientSocket.getOutputStream().write(buffer, 0, read);
-						if (proxyToServerSocket.getInputStream().available() < 1) {
-							clientSocket.getOutputStream().flush();
-						}
-					}
-				} while (read >= 0);
-			}
-			catch (SocketTimeoutException e) {
-				
-			}
-			catch (IOException e) {
-				e.printStackTrace();
-			}
-
-
-			// Close Down Resources
-			if(proxyToServerSocket != null){
-				proxyToServerSocket.close();
-			}
-
-			if(proxyToServerBR != null){
-				proxyToServerBR.close();
-			}
-
-			if(proxyToServerBW != null){
-				proxyToServerBW.close();
-			}
-
-			if(proxyToClientBw != null){
-				proxyToClientBw.close();
-			}
-			
-			
+            sync(proxyToServerSocket);
 		} catch (SocketTimeoutException e) {
 			String line = "HTTP/1.0 504 Timeout Occured after 10s\n" +
 					"User-Agent: LDProxy/1.0\n" +
@@ -381,7 +332,123 @@ public class RequestHandler implements Runnable {
 		}
 	}
 
-	
+    private void handleHTTPSRequest2(String urlString) {
+        try {
+            // Extract the URL and port of remote
+            String url = urlString.substring(7);
+            String[] pieces = url.split(":");
+            url = pieces[0];
+            int port = Integer.parseInt(pieces[1]);
+
+            // Only first line of HTTPS request has been read at this point (CONNECT *)
+            // Read (and throw away) the rest of the initial data on the stream
+            for (int i = 0; i < 5; i++) {
+                proxyToClientBr.readLine();
+            }
+
+            // Let's open a secure connection to the server
+            SSLContext sslContext = SSLContext.getInstance("SSL");
+            sslContext.init(null, null, null);
+            SSLSocket serverSocket = (SSLSocket) sslContext.getSocketFactory().createSocket(url, port);
+            serverSocket.startHandshake();
+
+            // Obtain information of the server's certificate we need for our certificate with the client
+            X509Certificate[] certificates = (X509Certificate[]) serverSocket.getSession().getPeerCertificates();
+            Principal serverDN = certificates[0].getSubjectX500Principal();
+            BigInteger serverSerialNumber = certificates[0].getSerialNumber();
+
+            // Create a forged certificate and a key manager factory and trust manager factory with the forged certificate
+            KeyStore keyStore = CertificateBuilder.createForgedCertificateFor(serverDN, serverSerialNumber);
+            KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+            keyManagerFactory.init(keyStore, new char[]{});
+            TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            trustManagerFactory.init(keyStore);
+
+            // Set up a secure connection with the client
+            SSLContext ssl = SSLContext.getInstance("SSL");
+            ssl.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), null);
+            ServerSocket localProxy = ssl.getServerSocketFactory().createServerSocket(0, 50, InetAddress.getByName("localhost"));
+            Socket sslProxySocket = ssl.getSocketFactory().createSocket("localhost", localProxy.getLocalPort());
+
+            // Transfer all data from the client socket to the secured client proxy and vice versa
+            new Thread(new ClientToServerHttpsTransmit(
+                    clientSocket.getInputStream(),
+                    sslProxySocket.getOutputStream())
+            ).start();
+
+            new Thread(new ClientToServerHttpsTransmit(
+                    sslProxySocket.getInputStream(),
+                    clientSocket.getOutputStream())
+            ).start();
+
+            // Send Connection established to the client
+            String line = "HTTP/1.0 200 Connection established\r\n" +
+                    "Proxy-Agent: LDProxy/1.0\r\n" +
+                    "\r\n";
+            proxyToClientBw.write(line);
+            proxyToClientBw.flush();
+
+			// Client and Remote will both start sending data to proxy at this point
+			// Proxy needs to asynchronously read data from each party and send it to the other party
+			clientSocket = localProxy.accept();
+			sync(serverSocket);
+        } catch (Exception e) {
+            System.out.println("Error on HTTPS : " + urlString);
+            e.printStackTrace();
+        }
+    }
+
+    private void sync(Socket proxyToServerSocket) throws IOException {
+        //Create a Buffered Writer betwen proxy and remote
+        BufferedWriter proxyToServerBW = new BufferedWriter(new OutputStreamWriter(proxyToServerSocket.getOutputStream()));
+
+        // Create Buffered Reader from proxy and remote
+        BufferedReader proxyToServerBR = new BufferedReader(new InputStreamReader(proxyToServerSocket.getInputStream()));
+
+        // Create a new thread to listen to client and transmit to server
+        ClientToServerHttpsTransmit clientToServerHttps =
+                new ClientToServerHttpsTransmit(clientSocket.getInputStream(), proxyToServerSocket.getOutputStream());
+
+        httpsClientToServer = new Thread(clientToServerHttps);
+        httpsClientToServer.start();
+
+        // Listen to remote server and relay to client
+        try {
+            byte[] buffer = new byte[4096];
+            int read;
+            do {
+                read = proxyToServerSocket.getInputStream().read(buffer);
+                if (read > 0) {
+                    clientSocket.getOutputStream().write(buffer, 0, read);
+                    if (proxyToServerSocket.getInputStream().available() < 1) {
+                        clientSocket.getOutputStream().flush();
+                    }
+                }
+            } while (read >= 0);
+        } catch (SocketTimeoutException e) {
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+
+        // Close Down Resources
+        if (proxyToServerSocket != null) {
+            proxyToServerSocket.close();
+        }
+
+        if (proxyToServerBR != null) {
+            proxyToServerBR.close();
+        }
+
+        if (proxyToServerBW != null) {
+            proxyToServerBW.close();
+        }
+
+        if (proxyToClientBw != null) {
+            proxyToClientBw.close();
+        }
+    }
 
 
 	/**
