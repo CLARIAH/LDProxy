@@ -23,6 +23,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.security.KeyStore;
+import java.security.NoSuchAlgorithmException;
 import java.security.Principal;
 import java.security.cert.X509Certificate;
 import java.util.logging.Level;
@@ -39,6 +40,7 @@ import javax.net.ssl.TrustManagerFactory;
 import nl.clariah.ldproxy.recipe.Recipe;
 
 public class RequestHandler implements Runnable {
+	private static final SSLContext SSL;
 
 	/**
 	 * Socket connected to client passed by Proxy server
@@ -61,6 +63,14 @@ public class RequestHandler implements Runnable {
 	 * Reference to this is required so it can be closed once completed.
 	 */
 	private Thread httpsClientToServer;
+
+	static {
+		try {
+			SSL = SSLContext.getInstance("SSL");
+		} catch (NoSuchAlgorithmException e) {
+			throw new RuntimeException(e);
+		}
+	}
 
 
 	/**
@@ -347,9 +357,8 @@ public class RequestHandler implements Runnable {
             }
 
             // Let's open a secure connection to the server
-            SSLContext sslContext = SSLContext.getInstance("SSL");
-            sslContext.init(null, null, null);
-            SSLSocket serverSocket = (SSLSocket) sslContext.getSocketFactory().createSocket(url, port);
+            SSL.init(null, null, null);
+            SSLSocket serverSocket = (SSLSocket) SSL.getSocketFactory().createSocket(url, port);
             serverSocket.startHandshake();
 
             // Obtain information of the server's certificate we need for our certificate with the client
@@ -365,21 +374,23 @@ public class RequestHandler implements Runnable {
             trustManagerFactory.init(keyStore);
 
             // Set up a secure connection with the client
-            SSLContext ssl = SSLContext.getInstance("SSL");
-            ssl.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), null);
-            ServerSocket localProxy = ssl.getServerSocketFactory().createServerSocket(0, 50, InetAddress.getByName("localhost"));
-            Socket sslProxySocket = ssl.getSocketFactory().createSocket("localhost", localProxy.getLocalPort());
+            SSL.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), null);
+//            ServerSocket localProxy = SSL.getServerSocketFactory().createServerSocket(0, 50, InetAddress.getByName("localhost"));
+//            Socket sslProxySocket = SSL.getSocketFactory().createSocket("localhost", localProxy.getLocalPort());
+			SSLSocket sslClientSocket = (SSLSocket) SSL.getSocketFactory()
+					.createSocket(clientSocket, null, clientSocket.getPort(), false);
+			sslClientSocket.setUseClientMode(false);
 
-            // Transfer all data from the client socket to the secured client proxy and vice versa
-            new Thread(new ClientToServerHttpsTransmit(
-                    clientSocket.getInputStream(),
-                    sslProxySocket.getOutputStream())
-            ).start();
-
-            new Thread(new ClientToServerHttpsTransmit(
-                    sslProxySocket.getInputStream(),
-                    clientSocket.getOutputStream())
-            ).start();
+//            // Transfer all data from the client socket to the secured client proxy and vice versa
+//            new Thread(new ClientToServerHttpsTransmit(
+//                    clientSocket.getInputStream(),
+//                    sslProxySocket.getOutputStream())
+//            ).start();
+//
+//            new Thread(new ClientToServerHttpsTransmit(
+//                    sslProxySocket.getInputStream(),
+//                    clientSocket.getOutputStream())
+//            ).start();
 
             // Send Connection established to the client
             String line = "HTTP/1.0 200 Connection established\r\n" +
@@ -390,7 +401,8 @@ public class RequestHandler implements Runnable {
 
 			// Client and Remote will both start sending data to proxy at this point
 			// Proxy needs to asynchronously read data from each party and send it to the other party
-			clientSocket = localProxy.accept();
+			//clientSocket = localProxy.accept();
+			clientSocket = sslClientSocket;
 			sync(serverSocket);
         } catch (Exception e) {
             System.out.println("Error on HTTPS : " + urlString);
